@@ -2,8 +2,10 @@
 
 import logging
 import json
+from urlparse import urlsplit, urljoin
 
 import requests
+import parsel
 
 from patient import Patient
 from study import Study
@@ -18,12 +20,15 @@ class PACS(object):
     def __repr__(self):
         return '<PACS object. host: "{}", port: "{}", aet="{}">'.format(self.host, self.port, self.aet)
 
-    def __init__(self, schema='http', host='localhost', port='8080', aet='DCM4CHEE', use_session=True, log_urls=False):
+    def __init__(self, schema='http', host='localhost', port='8080', aet='DCM4CHEE',
+                 user=None, password=None, log_urls=False):
         self.schema = schema
         self.aet = aet
         self.host = host
         self.port = port
         self.log_urls = log_urls  # for debugging
+        self.user = user
+        self.password = password
         if self.log_urls:
             logger = logging.getLogger()
             logger.setLevel(logging.INFO)
@@ -33,9 +38,18 @@ class PACS(object):
         self.base_wado_url = '{}://{}:{}/dcm4chee-arc/aets/{}/wado/'.format(
             self.schema, self.host, self.port, self.aet
         )
-        self.session = None
-        if use_session:
-            self.session = requests.Session()
+        self.session = requests.Session()
+        # determine if the api needs auth
+        resp = self._make_request(service='rs', path='studies', params={'limit': 1})
+        if '/auth/realms' in urlsplit(resp.url).path:
+            self.authorize(resp)
+
+    def authorize(self, response):
+        sel = parsel.Selector(response.text)
+        post_url = sel.css('form::attr(action)').extract_first()
+        resp = self.session.post(post_url, data={'username': self.user, 'password': self.password})
+        if '/auth/realms' in resp.url:
+            raise Exception('Failed auth')
 
     def get_patients(self, offset=0, limit=50, orderby=None, filter_attributes=None):
         patient_list = []
@@ -79,13 +93,12 @@ class PACS(object):
         if params is None:
             params = {}
 
-        request_method = self.session.request if self.session else requests.request
         base_url = self.base_rs_url if service == 'rs' else self.base_wado_url
         stream = True if service == 'wado' else False
         if path and path[0] == '/':
             path = path[1:]
-        url = '{}{}'.format(base_url, path)
-        resp = request_method(method=method, url=url, params=params, headers=headers, stream=stream)
+        url = urljoin(base_url, path)
+        resp = self.session.request(method=method, url=url, params=params, headers=headers, stream=stream)
         if self.log_urls:
             logging.info('Response URL: {}'.format(resp.url))
 
@@ -95,9 +108,7 @@ class PACS(object):
                     return resp.json()
                 except ValueError:
                     return []
-            elif resp.headers.get('Content-Type') == 'application/dicom':
-                return resp
             else:
-                return resp.text
+                return resp
         else:
             raise Exception('Non-200 response for {} (status: {})'.format(resp.url, resp.status_code))
